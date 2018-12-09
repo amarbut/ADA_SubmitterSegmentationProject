@@ -1,0 +1,298 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(cluster)
+library(factoextra)
+library(reshape2)
+library(tidytext)
+```
+# Submitter Segmentation
+## Principle Component Analysis and K-Means Clustering
+
+###TL;DR
+
+In this project I explored techniques for clustering observations based on high-dimensional, very sparse, binary behavioral data. The final results were created using a combination of sampling, dimension-reduction through Principle Component Analysis, and clustering using the K-means algorithm. These methods suggested 5 or 12 clusters of observations from a 5K X 5K matrix of observations and variables. Text analysis on descriptions associated with the variables did not produce immediately obvious categories for the clusters.
+
+###Exploring our Submitters
+
+Last Spring I finagled my way into an internship at an awesome local tech startup, which turned into part-time work while I finish up my graduate program this year. Our company provides a cloud-based submission management platform, and our clients consist of any organizations that need to accept some sort of submission from the public. We started mainly in the publishing industry, with literary journals making up the bulk of our clients, but over the last few years we've quickly expanded into other arts and media industries, the grants/foundations industry, and numerous others.
+
+While we've spent a lot of time trying to better understand who our clients are, very little work has been done on the submitter side. For this reason, I decided I'd like to do an exploration of our submitters for my Master's Capstone (read:thesis), starting this semester with a simple (or so I thought) cluster analysis. Since we do have a variety of types of organizations using our platform, I thought a straightforward first effort would be to segment the submitters based on which opportunities they'd submitted to.
+
+###Dealing with Big Sparse Data
+
+Like with any data analysis, the first step was getting the data I needed. I needed to pull all submitter-opportunity combinations, and since I knew that I wanted to do a text analysis to assess the clusters I came up with, I wanted to pull the opportunity descriptions as well (ie. "We're now accepting poetry submissions for our April issue of Literary Journal X"). So I went to our data base in Redshift and wrote my query. When the query was taking longer than expected, I decided to do some exploration to see what the problem might be. It turns out that we have ~130K opportunities and ~4.2M submitters in our database, with ~12M submissions between them. Pulling this all together in one query would not only timeout the connection to the database, but it would be too big to hold in memory (because of the size and duplication of the descriptions).
+
+My first solution was to split the query up by submission year to deal with both problems at once. While this allowed me to pull the data, I was still left with over 20GB of data. Then I tried filtering for submitters who had made at least three submissions, and opportunities that had received at least three submissions. This left me with only ~3.6M submitters and ~64K opportunities, but still over 15GB of data. So finally I stripped off the descriptions into their own dictionary which left me with a very reasonable ~350MB of data.
+
+Finally I was able to pull all of the years' submission data together into one python object and then use `pandas.get_dummies` to turn the opportunities into dummy variables with a 1 if the submitter had submitted to it, or a 0 if not. Because this results in a 3.6M x 64K matrix, I needed to specify that it be stored as a sparse dataframe to still be able to hold it in memory.
+
+```
+#combine files from all years and convert to sparse pandas df 
+files = [0]*9
+for idx, file in enumerate(os.listdir("cleaned")):
+    with open("cleaned/"+file, "rb") as f:
+        files[idx] = pickle.load(f)
+
+combined = pd.concat(files, ignore_index = True)
+
+#create dummy variables
+sparse_try = pd.get_dummies(combined, sparse = True)
+```
+
+At this point I'd done a lot of research about working with high-dimensional sparse data, and I'd run across a lot of people who pointed out that trying to cluster very sparse data would be fraught with errors because of the way that clustering algorithms were set up. So I'd decided to use Principle Component Analysis for dimension reduction to make the data denser.
+
+```
+pca = PCA(n_components = 1000)
+pca.fit(sparse_try)
+```
+And I immediately got a MemoryError. Of course this makes sense, since running a PCA creates a correlation matrix for the data, meaning that it was trying to make a 3.6M x 3.6M non-sparse matrix. I looked around for other options and tried several, including `Incremental_PCA` which performs singular value decomposition (SVD) on chunks of the data and then combines them, garnering results almost identical to those of a PCA. But no matter how small I made the chunks, I was still getting a MemoryError.
+
+Although I'd really like to figure out a way to perform the analysis on all of the submitters, I finally had to settle for taking a sample of the data so that I could have some sort of result to share by the end of the semester. If anyone has any good ideas for how to do this, *please* let me know! I'd still like to be able to do use all the data for my Capstone next semester.
+
+###Take Two: Smaller data makes everyone's lives easier
+
+Since the data I had was so sparse, I was concerned that taking a random sample might not leave me with enough data to get any meaningful results. So I decided to run the analysis on the 5000 highest-submitting submitters and the 5000 highest-receiving opportunities. Obviously this method of sampling is rife with potential bias (especially since we know that the majority of our opportunities are for literary journals), but it was the best option that I had for the purpose of this project.
+
+An added bonus to using a smaller dataset was that I felt comfortable moving back into R without losing too much performance. So I pulled my submitter-opportunity pairs into R and used tidyr's `spread` function to create my dummy variables. This gave me a 4982 x 4393 matrix (suggesting that there some submitters submitted to the same opportunity multiple times, and some of the opportunities didn't have any submissions from the top 5000 submitters). With 2.1M unique submissions, the matrix was ~90% sparse, so dimension reduction was still necessary.
+
+```{r, cache=TRUE, message=FALSE}
+#read in tsv of user/form submission pairs for 5000 highest submitting users
+#and 5000 highest receiving forms
+top5000 <- read_tsv("top5000.txt")
+
+#create a n_user x n_form matrix with ones for positive user/form submission pairs
+#and zeros elsewhere
+sparsedf <- top5000%>%
+  mutate(dummy = 1)%>%
+  distinct%>%
+  spread(productid, dummy, fill = 0)
+```
+
+I was then able to run the PCA and visualize the cumulative variance of each component to decide how many components to include in the clustering analysis. The goal is to significantly decrease the number of variables for clustering (and make the data much denser) without losing too much detail in the variance of the data.
+```{r, cache = TRUE, message=FALSE}
+#perform pca on matrix to compress into less sparse form for clustering
+pca <- sparsedf%>%
+  select(-userid)%>%
+  prcomp
+
+#visualize cumulative variance to determine number of components to include
+cum_var <- data.frame(sd = pca$sdev)
+cum_var <- cum_var%>%
+  mutate(eigs = sd^2,
+         cum_var = cumsum(eigs/sum(eigs)),
+         id = 1:n())
+```
+<center>
+```{r, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+cum_var%>%
+  ggplot(aes(x = id, y = cum_var))+
+  geom_line()+
+  labs(title = "PCA Cumulative Variance", x = "Principle Components",
+       y = "Cumulative Variance")
+```
+</center>
+```{r, cache = TRUE}
+#find number of components closest to 80% cumulative variance
+which.min(abs(cum_var$cum_var-0.80))
+```
+
+I included the first 959 principle components (a little more than 1/5 of the original variables) to account for 80% of the variance in the original data. The PCA analysis provides a vector of weights for each component, which shows how much each variable (column) affects that component. To create a new matrix for analysis using the principle components, matrix multiplication is used to calculate the weighted sum for each row (submitter) for each principle component.
+
+```{r, cache = TRUE, message=FALSE, warning=FALSE}
+#for each component, compute the dot product of each row/user and the pca rotation
+num_pcs = 959
+for (i in 1:num_pcs) {
+  pc_name <- paste0("PC", i)
+  sparsedf[, pc_name] <- as.matrix(sparsedf[,2:4393]) %*% pca$rotation[,i]
+}
+
+#select pca columns for clustering
+reduced_df <- sparsedf[,-c(1:4393)]
+```
+
+###Clustering Post-PCA
+
+Now that I finally had a dense-ish matrix to work with, it was time to start work on the "simple" clustering I'd set out to accomplish. I decided to use the K-means algorithm, which requires the user to provide a pre-determined number of clusters. There are several techniques to help decide what the optimal number of clusters might be. The simplest method is called the "elbow method", in which the sum of squares at each number of clusters is calculated and graphed, and the user looks for a change of slope from steep to shallow (an elbow) to determine the optimal number of clusters. This method is inexact, but still potentially helpful.
+
+*As a sidenote, in doing research for this project I discovered [this super helpful tutorial](https://uc-r.github.io/kmeans_clustering) about doing K-means clustering in R, which introduced me to the amazing `factoextra` package for clustering and visualizing cluster analyses*
+<center>
+```{r, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+#determine optimal number of clusters for data
+#using elbow plot
+fviz_nbclust(reduced_df,kmeans, method = "wss", k.max = 20, iter.max = 35)
+```
+</center>
+I've yet to see an elbow plot that really clearly indicates an specific number of clusters, but I'd say this one points to somewhere between 4 and 8 clusters.
+
+Another visualization that can help determine the optimal number of clusters is called the "silhouette method". Although I don't understand the inner-workings of this method quite as well, the theory is that any cluster has a "silhouette", or an area that in which its members lie. The "silhouette method" used here is a measure of how well the members fit into their clusters' silhouettes.
+<center>
+```{r, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+#using silhouette method
+fviz_nbclust(reduced_df, kmeans, method = "silhouette", k.max = 20, iter.max= 35)
+```
+</center>
+In reading this plot, a peak indicates a good "silhouette fit". Although the clearest peak is at 2 clusters, my knowledge of the data suggests that there should be more clusters than that, so I'll also look at 5, 12, and 16 clusters.
+
+In the code below, the argument `iter.max` is the number of times the algorithm will re-calculate the cluster centroids before giving up on reaching convergence and `nstart` is the number of times it will run the algorithm. Since the starting position of the cluster centroids is random, using nstart will allow R to pick the starting position that results in the tightest clusters.
+```{r, cache = TRUE}
+#run k-means algorithm with 2, 5, 12, and 16 clusters as potential best fits based on plots
+cluster2 <- kmeans(reduced_df, centers = 2, iter.max = 35, nstart = 25)
+cluster5 <- kmeans(reduced_df, centers = 5, iter.max = 35, nstart = 25)
+cluster12 <- kmeans(reduced_df, centers = 12, iter.max = 35, nstart = 25)
+cluster16 <- kmeans(reduced_df, centers = 16, iter.max = 35, nstart = 25)
+```
+
+`factoextra` does provide a really cool way of visualizing multidimensional clustering using `fviz_cluster()`. This function performs a PCA on the clusters, picks the two components with the highest explained variance, and then plots the clusters on those two components. This works great up to a certain number of variables, but this analysis has so many variables (959 to be specific), that none of the principle components has very much explained variance individually, so the plots never show really distinct clusters at all.
+
+Instead, I decided to compare the within-cluster sum of squares (a measure of how tight each cluster is) and the between-cluster sum of squares (a measure of how separated each cluster is from the others). The goal is to find a minimum within-cluster sum of squares, and a maximum between-cluster sum of squares.
+<center>
+```{r, echo = FALSE, message=FALSE, warning=FALSE, cache = TRUE}
+compare <- data.frame("n_clusters" = c(2, 5, 12, 16),
+                      "within_ss" = c(cluster2$tot.withinss, cluster5$tot.withinss, cluster12$tot.withinss, cluster16$tot.withinss),
+                      "between_ss" = c(cluster2$betweenss, cluster5$betweenss, cluster12$betweenss, cluster16$betweenss))
+
+compare <- melt(compare, id.vars = 'n_clusters')
+
+compare%>%
+  ggplot(aes(x = factor(n_clusters), y = value, fill = variable))+
+  geom_col(position = "dodge")+
+  labs(title = "Cluster Model Comparison", x = "Number of Clusters",
+       y = "Total Sum of Squares", fill = "Metric of Fit")
+```
+</center>
+
+The trick to picking an optimal number of clusters is to minimize the within-cluster sum of squares and maximize the between-cluster sum of squares, but not lose the ability to apply logical categories to the clusters by creating too many (or for smaller datasets, having so many clusters that you end up with almost as many as you started with). While the plot above does suggest that a higher number of clusters may be a better fit, I decided to continue the analysis with 5 and 12 clusters, to see if I can match them to categories.
+
+###Finding meaning behind the clustering results
+
+Normally a person would be able to go back to the matrix that the clustering algorithm was used on to look for patterns that might help to categorize the resulting clusters. However, my clustering data had already been processed through the principle components analysis, and so the variables used to cluster were already abstracted from the underlying data.
+
+Instead, I went back to the original pre-PCA dataset and made a list of all of the opportunities that the members of each group had submitted to. Then I went back to our Redshift database to pull the descriptions for those top 5000 opportunities and joined them with my cluster-opportunity lists. Code for the 5-cluster model is shown below.
+
+```{r, include = FALSE, cache = TRUE}
+form_desc <- readRDS("top5000_formdesc.Rds")
+```
+```{r, message=FALSE, warning=FALSE, cache = TRUE}
+#create df with cluster assignment for each submitter
+cluster5_forms <- data.frame("userid" = sparsedf$userid, "cluster" = cluster5$cluster)
+
+#join with original dataset to create cluster-opportunity combinations
+cluster5_forms <- cluster5_forms%>%
+  left_join(top5000, by = c("userid" = "userid"))%>%
+  group_by(cluster)%>%
+  count(productid)
+
+#join with opportunity descriptions
+cluster5_text <- cluster5_forms%>%
+  left_join(form_desc, by = c("productid" = "productid"))
+```
+```{r, include = FALSE, cache = TRUE}
+cluster12_forms <- data.frame("userid" = sparsedf$userid, "cluster" = cluster12$cluster)
+
+cluster12_forms <- cluster12_forms%>%
+  left_join(top5000, by = c("userid" = "userid"))%>%
+  group_by(cluster)%>%
+  count(productid)
+
+cluster12_text <- cluster12_forms%>%
+  left_join(form_desc, by = c("productid" = "productid"))
+```
+
+A fairly simple idea I had for categorizing the data was to see what the most frequent words were in the opportunity descriptions for that cluster. So I used my favorite text analysis package `tidytext` to clean up the text and calculate term frequency. The opportunity descriptions are written in a kind of pseudo-html, so I used the `format = "html"` argument to help clean up a lot of the formatting marks. Again, the code for the 5-cluster model is shown below.
+```{r, message=FALSE, warning=FALSE, cache = TRUE}
+#split by word, remove punctuation, stop words, and other formatting marks
+cluster5_tidytext <- cluster5_text%>%
+  unnest_tokens(word, description, format = "html", strip_punct = TRUE)%>%
+  anti_join(stop_words)
+
+#count term frequency by cluster
+cluster5_tf <- cluster5_tidytext%>%
+  group_by(cluster)%>%
+  count(word, sort = TRUE)%>%
+  ungroup()
+```
+<center>
+```{r, echo = FALSE, message = FALSE, warning=FALSE, cache=TRUE}
+
+cluster5_tf%>%
+  arrange(desc(nn)) %>%
+  mutate(word = factor(word, levels = rev(unique(word)))) %>% 
+  group_by(cluster) %>%
+  top_n(10)%>%
+  ungroup %>%
+  ggplot(aes(word, nn, fill = factor(cluster))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "Frequency") +
+  facet_wrap(~cluster, ncol = 2, scales = "free") +
+  coord_flip()
+```
+</center>
+```{r, include = FALSE, cache = TRUE}
+cluster12_tidytext <- cluster12_text%>%
+  unnest_tokens(word, description, format = "html", strip_punct = TRUE)%>%
+  anti_join(stop_words)  
+
+cluster12_tf <- cluster12_tidytext%>%
+  group_by(cluster)%>%
+  count(word, sort = TRUE)%>%
+  ungroup()
+```
+
+Unfortunately the most frequent terms are basically the same across all 5 clusters, and the same is true for the 12-cluster model. This is not particularly surprising, since all of opportunities have the same broad goal: to get people to send in submissions. Also, the sampling method that I used was pretty likely biased towards literary journals, so words like fiction, poetry, and publication show up across the board.
+
+A handy tool for situations like this is the tf-idf (term frequency - inverse document frequency) metric. This compares the term frequency in a "document" (in this case a cluster) to the term frequency in the whole "corpus" (all of the clusters combined) to find terms that are used disproportionately in one document. Theoretically, these words would be very specific to the content of that document.
+
+```{r, message=FALSE, warning=FALSE, cache = TRUE}
+# calculate tfidf for clusters
+cluster5_tfidf <- cluster5_tf%>%
+  bind_tf_idf(word, cluster, nn)
+```
+<center>
+```{r, echo=FALSE, warning=FALSE, message=FALSE, cache=FALSE}
+cluster5_tfidf%>%
+  arrange(desc(tf_idf)) %>%
+  mutate(word = factor(word, levels = rev(unique(word)))) %>% 
+  group_by(cluster) %>%
+  top_n(10)%>%
+  ungroup %>%
+  ggplot(aes(word, tf_idf, fill = factor(cluster))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "Frequency") +
+  facet_wrap(~cluster, ncol = 2, scales = "free") +
+  coord_flip()
+```
+</center>
+
+At least here we have different words in each cluster. The patterns aren't immediately obvious, and a lot of these tf-idf terms are names of specific opportunities or specific clients. But looking closer we can see that cluster 1 is obviously mostly in French, cluster 2 might be in the grants/foundations world (with MCAT, fiscal, deposited, and Ideascity all being related to grants), and cluster 4 could be visual arts-related (with SCAD, Halcyon, Jerwood, and NPAF all being arts-focused organizations).
+<center>
+```{r, echo = FALSE, warning=FALSE, message=FALSE, cache=FALSE, fig.height=10}
+cluster12_tfidf <- cluster12_tf%>%
+  bind_tf_idf(word, cluster, nn)
+
+cluster12_tfidf%>%
+  arrange(desc(tf_idf)) %>%
+  mutate(word = factor(word, levels = rev(unique(word)))) %>% 
+  group_by(cluster) %>%
+  top_n(10)%>%
+  ungroup %>%
+  ggplot(aes(word, tf_idf, fill = factor(cluster))) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "Frequency") +
+  facet_wrap(~cluster, ncol = 2, scales = "free") +
+  coord_flip()
+```
+</center>
+
+As there get to be more clusters, it gets harder to find patterns, but looking at the 12-cluster tf-idf results, we see a couple really obvious categories. Cluster 4, for example, is clearly focused around some sort of social-justice effort (with jurisdiction, negligence, arbitration, coalition, enforcement, etc.), cluster 8 pops up again as our French cluster, and cluster 10 has many of the same visual-arts tf-idf terms as cluster 4 above. We might think that cluster 1 is somehow related to women (with Harlequin, motherhood, Latina, and Shebooks), cluster 3 might be focused around the UK or Europe (with Europe, Albion, and Kensington), and cluster 12 might be related to Hawaii (with Maui and Haleakala).
+
+###What's next?
+
+This project obviously has a lot of loose ends left to figure out. The clusters that I ended up with were not easily categorized based on the opportunity descriptions, I was never really happy with the number of clusters that I was choosing, and, perhaps most importantly, I never figured out how to deal with all of the submission data that I wanted to include.
+
+My company is in a seemingly perpetual struggle figuring out how we want to label our clients, but one solution may be to try to cluster submitters based on some of those labels (where the client label is linked with each individual opportunity which is then linked to a user's submissions). Or it might prove more meaningful to use these labels in place of the opportunity descriptions to help categorize each cluster.
+
+I could also do a deeper exploration of different numbers of clusters to see if there might be some magical number that would give really clear categories. Or I've also considered ignoring the internet's advice and directly clustering the full-dimensional data (pre-PCA). Although I believe that there are theoretical issues with clustering sparse data, there's enough subjectivity in tweaking clustering algorithms that I'd be willing to give it a shot.
+
+I'll also probably play around with better, less biased, sampling methods and see whether that makes a difference in the resulting clusters. And again, if anyone has any brilliant ideas about working with all of the data at once (short of buying a mega-computer), *please please* let me know!
