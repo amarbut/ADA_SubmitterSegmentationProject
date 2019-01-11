@@ -104,3 +104,5 @@ sparsedf = pd.get_dummies(combined, sparse = True)
 #matrix too big to run PCA -- memory error occurs with any number of components  
 pca = PCA(n_components  = 1000)
 pca.fit(sparsedf)
+#also tried IncrementalPCA with batches from 5-10 columns
+#also tried truncatedSVD
