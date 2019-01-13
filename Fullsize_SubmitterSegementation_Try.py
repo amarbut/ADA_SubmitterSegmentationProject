@@ -8,7 +8,7 @@ import psycopg2
 import pandas as pd
 import pickle
 import os
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, TruncatedSVD
 #%%
 #collect all submitter/submission combinations per product createdate
 conn=psycopg2.connect(dbname= '', host='', 
@@ -94,7 +94,7 @@ for file in os.listdir("sans_forms"):
 files = []
 for idx, file in enumerate(os.listdir("cleaned")):
     with open("cleaned/"+file, "rb") as f:
-        files[idx] = pickle.load(f)
+        files.append(pickle.load(f))
 
 combined = pd.concat(files, ignore_index = True)
 
@@ -104,3 +104,5 @@ sparsedf = pd.get_dummies(combined, sparse = True)
 #matrix too big to run PCA -- memory error occurs with any number of components  
 pca = PCA(n_components  = 1000)
 pca.fit(sparsedf)
+#also tried IncrementalPCA with batches from 5-10 columns
+#also tried truncatedSVD
